@@ -25,6 +25,87 @@ code, which we can read but not officially write).
 - CUDA Toolkit: 13.1 (`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\`)
 - Host compiler: MSVC 14.29 (VS 2019 Build Tools)
 
+## Architecture — where each piece runs
+
+Two physical chips, two address spaces, two pieces of code we wrote. The CPU
+runs `hello.exe` in user space; the kernel-mode NVIDIA driver brokers every
+talk-to-the-GPU; PCIe is the wire; the GPU's SMs execute the SASS that came
+out of our hand-written PTX.
+
+```
++-------------------------------------------------------------+
+|                            CPU                              |
+|                                                             |
+|  USER SPACE                                                 |
+|  +-------------------------------------------------------+  |
+|  |  hello.exe   (our host program)            <-- WE     |  |
+|  |    int main() {                              WROTE    |  |
+|  |       cuModuleLoad("hello.cubin");           THIS     |  |
+|  |       cuLaunchKernel(...);                            |  |
+|  |    }                                                  |  |
+|  +-----------------------+-------------------------------+  |
+|                          | function calls                   |
+|                          v                                  |
+|  +-------------------------------------------------------+  |
+|  |  nvcuda.dll   (CUDA Driver API user-space library)    |  |
+|  |    cuModuleLoad, cuMemAlloc, cuLaunchKernel, ...      |  |
+|  +-----------------------+-------------------------------+  |
+|                          | ioctl / WDDM DDI calls           |
+|  ========================|================================  |
+|  KERNEL SPACE            v                                  |
+|  +-------------------------------------------------------+  |
+|  |  nvlddmkm.sys  (NVIDIA kernel-mode driver)            |  |
+|  |     - allocates DMA buffers in system RAM             |  |
+|  |     - builds GPU command packets                      |  |
+|  |     - rings a doorbell to submit work                 |  |
+|  +-----------------------+-------------------------------+  |
++--------------------------|----------------------------------+
+                           |
+                           |  MMIO writes  +  DMA reads/writes
+                           |
+              =============v=========== PCIe x16 =============
+                           |
+                           v
++-------------------------------------------------------------+
+|                  GPU — NVIDIA RTX 4060                      |
+|                  Ada Lovelace, sm_89, 8 GB GDDR6            |
+|                                                             |
+|  +-------------------------------------------------------+  |
+|  |  Front-end / GigaThread Engine                        |  |
+|  |    - receives command packets from the driver         |  |
+|  |    - schedules grids of thread blocks onto SMs        |  |
+|  +-----------------------+-------------------------------+  |
+|                          v                                  |
+|  +-------------------------------------------------------+  |
+|  |  Streaming Multiprocessors (SMs)                      |  |
+|  |    +-----------------------------------------------+  |  |
+|  |    |  warps of 32 threads execute SASS:            |  |  |
+|  |    |                                               |  |  |
+|  |    |    MOV   R1, c[0x0][0x28]      <-- WE WROTE   |  |  |
+|  |    |    S2R   R5, SR_TID.X              THE PTX    |  |  |
+|  |    |    IMAD.WIDE.U32 R2, R5, ...       THAT       |  |  |
+|  |    |    STG.E [R2.64], R5               BECAME     |  |  |
+|  |    |    EXIT                            THIS SASS  |  |  |
+|  |    +-----------------------------------------------+  |  |
+|  +-----------------------+-------------------------------+  |
+|                          v                                  |
+|  +-------------------------------------------------------+  |
+|  |  L2 cache  +  VRAM (8 GB GDDR6)                       |  |
+|  |    - holds hello.cubin's code                         |  |
+|  |    - holds the output[] array we cuMemAlloc'd         |  |
+|  +-------------------------------------------------------+  |
++-------------------------------------------------------------+
+```
+
+The two pieces we authored sit at opposite ends of this stack: `host.cpp` is
+the topmost box on the CPU side, `hello.ptx` (compiled to SASS) is the
+innermost box on the GPU side. Everything between them — nvcuda.dll, the
+kernel driver, PCIe transactions, the GPU's front-end — is plumbing that
+NVIDIA provides.
+
+> On Linux the equivalent kernel-side module is `nvidia.ko` and the
+> userspace library is `libcuda.so`. The shape of the stack is identical.
+
 ## Files
 
 | File | Role |
